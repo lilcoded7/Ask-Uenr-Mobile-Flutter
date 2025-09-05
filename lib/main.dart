@@ -1,9 +1,10 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
-import 'package:flutter_tts/flutter_tts.dart';
 import 'package:http/http.dart' as http;
 import 'dart:async';
 import 'dart:convert';
+import 'package:audioplayers/audioplayers.dart';
+import 'package:flutter_tts/flutter_tts.dart';
 
 void main() {
   runApp(const AskUnerApp());
@@ -23,20 +24,16 @@ class AskUnerApp extends StatelessWidget {
     return MaterialApp(
       title: 'AskUner - UENR Virtual Assistant',
       debugShowCheckedModeBanner: false,
-      theme: _buildAppTheme(),
-      home: const AskUnerHomePage(),
-    );
-  }
-
-  ThemeData _buildAppTheme() {
-    return ThemeData(
-      primarySwatch: Colors.green,
-      fontFamily: 'Roboto',
-      appBarTheme: const AppBarTheme(
-        backgroundColor: Colors.white,
-        elevation: 1,
-        iconTheme: IconThemeData(color: Color(0xFF1A4D2B)),
+      theme: ThemeData(
+        primarySwatch: Colors.green,
+        fontFamily: 'Roboto',
+        appBarTheme: const AppBarTheme(
+          backgroundColor: Colors.white,
+          elevation: 1,
+          iconTheme: IconThemeData(color: Color(0xFF1A4D2B)),
+        ),
       ),
+      home: const AskUnerHomePage(),
     );
   }
 }
@@ -48,67 +45,86 @@ class AskUnerHomePage extends StatefulWidget {
   State<AskUnerHomePage> createState() => _AskUnerHomePageState();
 }
 
-class _AskUnerHomePageState extends State<AskUnerHomePage> {
+class _AskUnerHomePageState extends State<AskUnerHomePage> with SingleTickerProviderStateMixin {
   final TextEditingController _messageController = TextEditingController();
   final List<ChatMessage> _messages = [];
   final ScrollController _scrollController = ScrollController();
+  final AudioPlayer _audioPlayer = AudioPlayer();
   final FlutterTts _flutterTts = FlutterTts();
   
   bool _isListening = false;
   bool _isMuted = false;
-  bool _isTyping = false;
+  bool _isThinking = false;
   bool _isSpeaking = false;
   
   String _currentResponse = "";
-  Timer? _typingTimer;
   Timer? _streamingTimer;
+  late AnimationController _animationController;
+  late Animation<double> _animation;
 
   @override
   void initState() {
     super.initState();
-    _initializeApp();
-  }
-
-  Future<void> _initializeApp() async {
-    await _initTextToSpeech();
+    _initTts();
+    _animationController = AnimationController(
+      duration: const Duration(milliseconds: 800),
+      vsync: this,
+    )..repeat(reverse: true);
+    
+    _animation = Tween<double>(begin: 0.8, end: 1.2).animate(
+      CurvedAnimation(parent: _animationController, curve: Curves.easeInOut),
+    );
+    
     _addWelcomeMessage();
   }
 
-  Future<void> _initTextToSpeech() async {
+  Future<void> _initTts() async {
     await _flutterTts.setLanguage("en-US");
-    await _flutterTts.setPitch(1.0);
     await _flutterTts.setSpeechRate(0.5);
+    await _flutterTts.setVolume(1.0);
+    await _flutterTts.setPitch(1.0);
     
-    _flutterTts.setStartHandler(() => setState(() => _isSpeaking = true));
-    _flutterTts.setCompletionHandler(() => setState(() => _isSpeaking = false));
+    _flutterTts.setStartHandler(() {
+      setState(() => _isSpeaking = true);
+    });
+    
+    _flutterTts.setCompletionHandler(() {
+      setState(() {
+        _isSpeaking = false;
+        _isThinking = false;
+      });
+      _animationController.stop();
+    });
+    
     _flutterTts.setErrorHandler((msg) {
-      setState(() => _isSpeaking = false);
+      setState(() {
+        _isSpeaking = false;
+        _isThinking = false;
+      });
+      _animationController.stop();
       debugPrint("TTS Error: $msg");
     });
   }
 
   void _addWelcomeMessage() {
-    const welcomeMsg = "Hello! I'm AskUner, your UENR virtual assistant. How can I help you today?";
-    setState(() => _messages.add(ChatMessage(
-      text: welcomeMsg,
-      isUser: false,
-      timestamp: DateTime.now(),
-    )));
-    _speak(welcomeMsg);
-  }
-
-  Future<void> _speak(String text) async {
-    if (_isMuted || text.isEmpty) return;
-    await _flutterTts.stop();
-    await _flutterTts.speak(text);
+    const welcomeMsg = "Hello! I'm AskUner, AI assistant for the University Of Energy And Natural Resources. I provide information about the University of Energy and Natural Resources, How can I help you today?";
+    setState(() {
+      _messages.add(ChatMessage(
+        text: welcomeMsg,
+        isUser: false,
+        timestamp: DateTime.now(),
+      ));
+    });
+    _speakResponse(welcomeMsg);
   }
 
   @override
   void dispose() {
     _messageController.dispose();
     _scrollController.dispose();
-    _typingTimer?.cancel();
     _streamingTimer?.cancel();
+    _animationController.dispose();
+    _audioPlayer.dispose();
     _flutterTts.stop();
     super.dispose();
   }
@@ -123,11 +139,11 @@ class _AskUnerHomePageState extends State<AskUnerHomePage> {
         isUser: true,
         timestamp: DateTime.now(),
       ));
-      _isTyping = true;
+      _isThinking = true;
     });
 
     _scrollToBottom();
-    _typingTimer = Timer(const Duration(seconds: 1), () => _generateAIResponse(text));
+    _generateAIResponse(text);
   }
 
   void _scrollToBottom() {
@@ -155,14 +171,30 @@ class _AskUnerHomePageState extends State<AskUnerHomePage> {
       if (response.statusCode == 200) {
         final responseData = jsonDecode(response.body);
         final aiResponse = responseData['answer'] ?? "I couldn't process that request. Please try again.";
-        _simulateTyping(aiResponse, () => _speak(aiResponse));
+        _simulateStreaming(aiResponse, () => _speakResponse(aiResponse));
       } else {
         throw Exception('Failed to get response from server');
       }
     } catch (e) {
       debugPrint('Error fetching AI response: $e');
       const errorResponse = "Sorry, I'm having trouble connecting to the server. Please try again later.";
-      _simulateTyping(errorResponse, () => _speak(errorResponse));
+      _simulateStreaming(errorResponse, () => _speakResponse(errorResponse));
+    }
+  }
+
+  Future<void> _speakResponse(String text) async {
+    if (_isMuted || text.isEmpty) {
+      setState(() => _isThinking = false);
+      return;
+    }
+
+    try {
+      _animationController.repeat(reverse: true);
+      await _flutterTts.speak(text);
+    } catch (e) {
+      debugPrint('Error in speech synthesis: $e');
+      setState(() => _isThinking = false);
+      _animationController.stop();
     }
   }
 
@@ -178,11 +210,11 @@ class _AskUnerHomePageState extends State<AskUnerHomePage> {
     });
   }
 
-  void _simulateTyping(String fullText, VoidCallback onComplete) {
+  void _simulateStreaming(String fullText, VoidCallback onComplete) {
     final words = fullText.split(' ');
     int wordIndex = 0;
     
-    _streamingTimer = Timer.periodic(const Duration(milliseconds: 100), (timer) {
+    _streamingTimer = Timer.periodic(const Duration(milliseconds: 50), (timer) {
       if (wordIndex < words.length) {
         setState(() {
           _currentResponse += '${words[wordIndex]} ';
@@ -197,7 +229,6 @@ class _AskUnerHomePageState extends State<AskUnerHomePage> {
         _scrollToBottom();
       } else {
         timer.cancel();
-        setState(() => _isTyping = false);
         onComplete();
       }
     });
@@ -206,8 +237,13 @@ class _AskUnerHomePageState extends State<AskUnerHomePage> {
   void _toggleMute() {
     setState(() {
       _isMuted = !_isMuted;
-      if (_isMuted && _isSpeaking) {
+      if (_isMuted) {
         _flutterTts.stop();
+        _animationController.stop();
+        setState(() {
+          _isSpeaking = false;
+          _isThinking = false;
+        });
       }
     });
   }
@@ -215,154 +251,176 @@ class _AskUnerHomePageState extends State<AskUnerHomePage> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: _buildAppBar(),
+      appBar: AppBar(
+        title: Row(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            Image.asset(
+              'assets/uenr_logo.png',
+              height: 30,
+              fit: BoxFit.contain,
+            ),
+            const SizedBox(width: 10),
+            const Text(
+              'AskUner',
+              style: TextStyle(
+                color: Color(0xFF1A4D2B),
+                fontWeight: FontWeight.bold,
+              ),
+            ),
+          ],
+        ),
+        actions: [
+          IconButton(
+            icon: Icon(_isMuted ? Icons.volume_off : Icons.volume_up),
+            onPressed: _toggleMute,
+          ),
+          IconButton(
+            icon: const Icon(Icons.menu),
+            onPressed: () => _showMenuDrawer(context),
+          ),
+        ],
+      ),
       body: Column(
         children: [
           _buildAvatarSection(),
-          _buildChatMessages(),
-          _buildInputSection(),
-        ],
-      ),
-    );
-  }
-
-  AppBar _buildAppBar() {
-    return AppBar(
-      title: Row(
-        mainAxisAlignment: MainAxisAlignment.center,
-        children: [
-          Image.asset(
-            'assets/uenr_logo.png',
-            height: 30,
-            fit: BoxFit.contain,
+          Expanded(
+            child: Container(
+              color: const Color(0xFFF5F5F5),
+              child: ListView.builder(
+                controller: _scrollController,
+                padding: const EdgeInsets.symmetric(horizontal: 8.0),
+                itemCount: _messages.length,
+                itemBuilder: (context, index) => ChatBubble(
+                  message: _messages[index],
+                  isUser: _messages[index].isUser,
+                  isStreaming: _messages[index].isStreaming,
+                ),
+              ),
+            ),
           ),
-          const SizedBox(width: 10),
-          const Text(
-            'AskUner',
-            style: TextStyle(
-              color: Color(0xFF1A4D2B),
-              fontWeight: FontWeight.bold,
+          Container(
+            padding: const EdgeInsets.symmetric(horizontal: 8.0, vertical: 8.0),
+            decoration: BoxDecoration(
+              color: Colors.white,
+              boxShadow: [
+                BoxShadow(
+                  color: Colors.grey.withOpacity(0.2),
+                  spreadRadius: 1,
+                  blurRadius: 3,
+                  offset: const Offset(0, -2),
+                ),
+              ],
+            ),
+            child: Row(
+              children: [
+                IconButton(
+                  icon: Icon(
+                    _isListening ? Icons.mic_off : Icons.mic,
+                    color: const Color(0xFF1A4D2B),
+                  ),
+                  onPressed: () => setState(() => _isListening = !_isListening),
+                ),
+                Expanded(
+                  child: TextField(
+                    controller: _messageController,
+                    maxLines: 3,
+                    minLines: 1,
+                    decoration: InputDecoration(
+                      hintText: 'Ask me anything about the University of Energy and Natural Resources...',
+                      border: OutlineInputBorder(
+                        borderRadius: BorderRadius.circular(25.0),
+                        borderSide: BorderSide.none,
+                      ),
+                      filled: true,
+                      fillColor: const Color(0xFFEEEEEE),
+                      contentPadding: const EdgeInsets.symmetric(
+                        horizontal: 16.0,
+                        vertical: 12.0,
+                      ),
+                    ),
+                    onSubmitted: _handleSubmitted,
+                  ),
+                ),
+                IconButton(
+                  icon: const Icon(Icons.send, color: Color(0xFF1A4D2B)),
+                  onPressed: () => _handleSubmitted(_messageController.text),
+                ),
+              ],
             ),
           ),
         ],
       ),
-      actions: [
-        IconButton(
-          icon: Icon(_isMuted ? Icons.volume_off : Icons.volume_up),
-          onPressed: _toggleMute,
-        ),
-        IconButton(
-          icon: const Icon(Icons.menu),
-          onPressed: () => _showMenuDrawer(context),
-        ),
-      ],
     );
   }
 
   Widget _buildAvatarSection() {
     return Container(
-      padding: const EdgeInsets.symmetric(vertical: 10),
+      padding: const EdgeInsets.symmetric(vertical: 20),
       color: Colors.white,
       child: Center(
-        child: Container(
-          width: 120,
-          height: 120,
-          decoration: BoxDecoration(
-            borderRadius: BorderRadius.circular(60),
-            border: Border.all(
-              color: const Color(0xFF1A4D2B),
-              width: 2,
-            ),
-            boxShadow: [
-              BoxShadow(
-                color: Colors.grey.withOpacity(0.3),
-                spreadRadius: 2,
-                blurRadius: 5,
-                offset: const Offset(0, 2),
-              ),
-            ],
-          ),
-          child: ClipRRect(
-            borderRadius: BorderRadius.circular(60),
-            child: _isTyping || _isSpeaking
-                ? const Center(child: TypingIndicator())
-                : const Center(
-                    child: Icon(Icons.person, size: 40, color: Color(0xFF1A4D2B)),
+        child: AnimatedBuilder(
+          animation: _animation,
+          builder: (context, child) {
+            return Container(
+              width: 100,
+              height: 100,
+              decoration: BoxDecoration(
+                shape: BoxShape.circle,
+                color: const Color(0xFFE8F5E9),
+                border: Border.all(
+                  color: const Color(0xFF1A4D2B),
+                  width: 2,
+                ),
+                boxShadow: [
+                  BoxShadow(
+                    color: Colors.grey.withOpacity(0.3),
+                    spreadRadius: 2,
+                    blurRadius: 5,
+                    offset: const Offset(0, 2),
                   ),
-          ),
-        ),
-      ),
-    );
-  }
-
-  Widget _buildChatMessages() {
-    return Expanded(
-      child: Container(
-        color: const Color(0xFFF5F5F5),
-        child: ListView.builder(
-          controller: _scrollController,
-          padding: const EdgeInsets.symmetric(horizontal: 8.0),
-          itemCount: _messages.length,
-          itemBuilder: (context, index) => ChatBubble(
-            message: _messages[index],
-            isUser: _messages[index].isUser,
-            isStreaming: _messages[index].isStreaming,
-          ),
-        ),
-      ),
-    );
-  }
-
-  Widget _buildInputSection() {
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 8.0, vertical: 8.0),
-      decoration: BoxDecoration(
-        color: Colors.white,
-        boxShadow: [
-          BoxShadow(
-            color: Colors.grey.withOpacity(0.2),
-            spreadRadius: 1,
-            blurRadius: 3,
-            offset: const Offset(0, -2),
-          ),
-        ],
-      ),
-      child: Row(
-        children: [
-          IconButton(
-            icon: Icon(
-              _isListening ? Icons.mic_off : Icons.mic,
-              color: const Color(0xFF1A4D2B),
-            ),
-            onPressed: () => setState(() => _isListening = !_isListening),
-          ),
-          Expanded(
-            child: TextField(
-              controller: _messageController,
-              maxLines: 3,
-              minLines: 1,
-              decoration: InputDecoration(
-                hintText: 'Ask me anything about UENR...',
-                border: OutlineInputBorder(
-                  borderRadius: BorderRadius.circular(25.0),
-                  borderSide: BorderSide.none,
-                ),
-                filled: true,
-                fillColor: const Color(0xFFEEEEEE),
-                contentPadding: const EdgeInsets.symmetric(
-                  horizontal: 16.0,
-                  vertical: 12.0,
-                ),
+                ],
               ),
-              onSubmitted: _handleSubmitted,
+              child: Stack(
+                alignment: Alignment.center,
+                children: [
+                  if (_isThinking || _isSpeaking)
+                    _buildThinkingAnimation()
+                  else
+                    const Icon(
+                      Icons.smart_toy,
+                      size: 40,
+                      color: Color(0xFF1A4D2B),
+                    ),
+                ],
+              ),
+            );
+          },
+        ),
+      ),
+    );
+  }
+
+  Widget _buildThinkingAnimation() {
+    return Row(
+      mainAxisAlignment: MainAxisAlignment.center,
+      children: List.generate(3, (index) {
+        return Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 4),
+          child: ScaleTransition(
+            scale: DelayTween(begin: 0.4, end: 1.2, delay: index * 0.2)
+                .animate(_animationController),
+            child: Container(
+              width: 10,
+              height: 10,
+              decoration: const BoxDecoration(
+                color: Color(0xFF1A4D2B),
+                shape: BoxShape.circle,
+              ),
             ),
           ),
-          IconButton(
-            icon: const Icon(Icons.send, color: Color(0xFF1A4D2B)),
-            onPressed: () => _handleSubmitted(_messageController.text),
-          ),
-        ],
-      ),
+        );
+      }),
     );
   }
 
@@ -418,7 +476,7 @@ class _AskUnerHomePageState extends State<AskUnerHomePage> {
       ),
     );
   }
-  
+
   ChoiceChip _buildProfileChip(String label, bool selected) {
     return ChoiceChip(
       label: Text(label),
@@ -468,62 +526,56 @@ class ChatBubble extends StatelessWidget {
     return Container(
       margin: const EdgeInsets.symmetric(vertical: 5),
       child: Row(
-        mainAxisAlignment: isUser ? MainAxisAlignment.end : MainAxisAlignment.start,
+        mainAxisAlignment:
+            isUser ? MainAxisAlignment.end : MainAxisAlignment.start,
         crossAxisAlignment: CrossAxisAlignment.end,
         children: [
-          if (!isUser) _buildBotAvatar(),
-          Flexible(child: _buildMessageBubble()),
-          if (isUser) _buildUserAvatar(),
+          if (!isUser)
+            const CircleAvatar(
+              radius: 12,
+              backgroundColor: Color(0xFF1A4D2B),
+              child: Icon(Icons.smart_toy, size: 12, color: Colors.white),
+            ),
+          Flexible(
+            child: Container(
+              margin: const EdgeInsets.symmetric(horizontal: 8),
+              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+              decoration: BoxDecoration(
+                color:
+                    isUser ? const Color(0xFFD4EDDA) : const Color(0xFFE8F5E9),
+                borderRadius: BorderRadius.only(
+                  topLeft: const Radius.circular(20),
+                  topRight: const Radius.circular(20),
+                  bottomLeft: Radius.circular(isUser ? 20 : 0),
+                  bottomRight: Radius.circular(isUser ? 0 : 20),
+                ),
+                border: Border.all(
+                  color: isUser
+                      ? const Color(0xFFA5D6A7)
+                      : const Color(0xFFC8E6C9),
+                  width: 1,
+                ),
+              ),
+              child: isStreaming
+                  ? const TypingIndicator()
+                  : Text(
+                      message.text,
+                      style: TextStyle(
+                        color: isUser
+                            ? const Color(0xFF1A4D2B)
+                            : const Color(0xFF333333),
+                      ),
+                    ),
+            ),
+          ),
+          if (isUser)
+            const CircleAvatar(
+              radius: 12,
+              backgroundColor: Color(0xFF1A4D2B),
+              child: Icon(Icons.person, size: 12, color: Colors.white),
+            ),
         ],
       ),
-    );
-  }
-
-  Widget _buildBotAvatar() {
-    return const CircleAvatar(
-      radius: 12,
-      backgroundColor: Color(0xFF1A4D2B),
-      child: Icon(Icons.smart_toy, size: 12, color: Colors.white),
-    );
-  }
-
-  Widget _buildUserAvatar() {
-    return const CircleAvatar(
-      radius: 12,
-      backgroundColor: Color(0xFF1A4D2B),
-      child: Icon(Icons.person, size: 12, color: Colors.white),
-    );
-  }
-
-  Widget _buildMessageBubble() {
-    return Container(
-      margin: const EdgeInsets.symmetric(horizontal: 8),
-      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
-      decoration: BoxDecoration(
-        color: isUser ? const Color(0xFFD4EDDA) : const Color(0xFFE8F5E9),
-        borderRadius: _buildMessageBorderRadius(),
-        border: Border.all(
-          color: isUser ? const Color(0xFFA5D6A7) : const Color(0xFFC8E6C9),
-          width: 1,
-        ),
-      ),
-      child: isStreaming 
-          ? const TypingIndicator() 
-          : Text(
-              message.text,
-              style: TextStyle(
-                color: isUser ? const Color(0xFF1A4D2B) : const Color(0xFF333333),
-              ),
-            ),
-    );
-  }
-
-  BorderRadius _buildMessageBorderRadius() {
-    return BorderRadius.only(
-      topLeft: const Radius.circular(20),
-      topRight: const Radius.circular(20),
-      bottomLeft: Radius.circular(isUser ? 20 : 0),
-      bottomRight: Radius.circular(isUser ? 0 : 20),
     );
   }
 }
@@ -563,24 +615,38 @@ class _TypingIndicatorState extends State<TypingIndicator>
   Widget build(BuildContext context) {
     return Row(
       mainAxisSize: MainAxisSize.min,
-      children: List.generate(3, (index) => _buildDot()),
-    );
-  }
-
-  Widget _buildDot() {
-    return Padding(
-      padding: const EdgeInsets.symmetric(horizontal: 2),
-      child: ScaleTransition(
-        scale: _animation,
-        child: Container(
-          width: 8,
-          height: 8,
-          decoration: BoxDecoration(
-            color: const Color(0xFF1A4D2B),
-            borderRadius: BorderRadius.circular(4),
+      children: List.generate(3, (index) => Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 2),
+        child: ScaleTransition(
+          scale: _animation,
+          child: Container(
+            width: 8,
+            height: 8,
+            decoration: BoxDecoration(
+              color: const Color(0xFF1A4D2B),
+              borderRadius: BorderRadius.circular(4),
+            ),
           ),
         ),
-      ),
+      )),
     );
   }
+}
+
+class DelayTween extends Tween<double> {
+  DelayTween({
+    double? begin,
+    double? end,
+    required this.delay,
+  }) : super(begin: begin, end: end);
+
+  final double delay;
+
+  @override
+  double lerp(double t) {
+    return super.lerp((t - delay).clamp(0.0, 1.0));
+  }
+
+  @override
+  double evaluate(Animation<double> animation) => lerp(animation.value);
 }
